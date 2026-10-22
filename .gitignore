@@ -1,10 +1,17 @@
-# data capture
-*.pcap
-*.out
-*.csv
-*.txt
-
-# Byte-compiled / optimized / DLL files
+# Python-generated files
 __pycache__/
 *.py[cod]
-*$py.class
+
+# Packet captures
+*.pcap
+
+# Generated logs and exports
+*.log
+*.out
+*.txt
+*.csv
+
+# Local analysis/capture helpers not included upstream
+pcap2csv.py
+shinemonitor_capture.sh
+shinemonitor_parser.py
