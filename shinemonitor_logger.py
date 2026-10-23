@@ -1,57 +1,88 @@
-import sys
-import time
+"""Passive packet-sniffing mode.
+
+Only works on a machine that actually sees the logger's traffic (the logger's gateway,
+or a mirrored switch port). On an ordinary switched network use the relay mode instead.
+"""
+
+import ipaddress
 import logging
+import socket
 import threading
+import time
 
 from dns import resolver
 from scapy.all import sniff, IP, TCP
 
-from parser_utils import DataParser
-from prometheus_client import start_http_server, Gauge
+from parser_utils import StreamDecoder
+
+log = logging.getLogger('shinemonitor.sniffer')
+
 
 class NetworkLogger:
-	def __init__(self, remote_hostnames, logger_hostname, dns_server='1.1.1.1', data_processor=None):
-		self.data_processor = data_processor
+	def __init__(self, remote_hostnames, logger_host, dns_server='1.1.1.1', data_processor=None,
+			traffic_log=None, on_crc_error=None):
+		self.data_processor = data_processor or (lambda values: None)
 		self.remote_hostnames = remote_hostnames
-		self.logger_hostname = logger_hostname
 		self.dns_server = dns_server
-		self.logger_ip = self.resolve_ip(self.logger_hostname)
+		self.logger_ip = self.resolve_local(logger_host)
 		self.remote_ips = set()
-		self.setup_logging()
+		self.decoder = StreamDecoder(on_crc_error=on_crc_error)
+		self.traffic_log = None
+		if traffic_log:
+			self.traffic_log = logging.getLogger('shinemonitor.traffic')
+			handler = logging.FileHandler(traffic_log)
+			handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s', '%Y-%m-%d %H:%M:%S'))
+			self.traffic_log.addHandler(handler)
+			self.traffic_log.propagate = False
 
-	def resolve_ip(self, hostname, dns_server=None):
-		resolver.nameservers = [self.dns_server]
+	@staticmethod
+	def resolve_local(host):
+		"""The logger is on the LAN, so use the system resolver (or accept an IP address)."""
 		try:
-			return set([answer.to_text() for answer in resolver.resolve(hostname, 'A')])
+			return {str(ipaddress.ip_address(host))}
+		except ValueError:
+			pass
+		try:
+			return {info[4][0] for info in socket.getaddrinfo(host, None, socket.AF_INET)}
+		except socket.gaierror as e:
+			raise SystemExit(f'Cannot resolve the logger address {host!r}: {e}. Pass its IP address instead.')
+
+	def resolve_remote(self, hostname):
+		"""The cloud servers are resolved through public DNS."""
+		res = resolver.Resolver(configure=False)
+		res.nameservers = [self.dns_server]
+		try:
+			return {answer.to_text() for answer in res.resolve(hostname, 'A')}
 		except Exception as e:
-			logging.error(f"Failed to resolve {hostname} using {self.dns_server}: {e}")
+			log.error('Failed to resolve %s using %s: %s', hostname, self.dns_server, e)
 			return set()
 
 	def update_remote_ips(self, update_interval=300):
-		"""Periodically update remote IPs."""
+		"""Periodically add the current cloud addresses."""
 		while True:
-			for remote_hostname in self.remote_hostnames:
-				self.remote_ips.update(self.resolve_ip(remote_hostname, self.dns_server))
-			print(f"{self.remote_hostnames} -> {self.remote_ips}")
+			for hostname in self.remote_hostnames:
+				self.remote_ips.update(self.resolve_remote(hostname))
+			log.debug('%s -> %s', self.remote_hostnames, self.remote_ips)
 			time.sleep(update_interval)
 
-	def packet_callback(self, packet):
-		logging.info(f"{packet[IP].src}:{packet[TCP].sport} -> {packet[IP].dst}:{packet[TCP].dport} | Payload size: {len(packet[TCP].payload)} | Payload: {packet[TCP].payload.original.hex()}")
-		if self.data_processor:
-			self.data_processor({"src_ip": packet[IP].src, "dst_ip": packet[IP].dst, "payload": packet[TCP].payload.original.hex()})
-
 	def packet_filter(self, packet):
-		if IP in packet and TCP in packet:
-			ip_layer = packet[IP]
-			_filter = ip_layer.src in self.logger_ip and ip_layer.dst in self.remote_ips
-			return _filter
+		if IP in packet and TCP in packet and len(packet[TCP].payload):
+			src, dst = packet[IP].src, packet[IP].dst
+			return (src in self.logger_ip and dst in self.remote_ips) or \
+				(src in self.remote_ips and dst in self.logger_ip)
 		return False
 
-	def start_monitoring(self):
-		ip_updater = threading.Thread(target=self.update_remote_ips, args=(300,), daemon=True)
-		ip_updater.start()
-		print("Starting full session traffic monitoring...")
-		sniff(prn=self.packet_callback, lfilter=self.packet_filter, store=False)
+	def packet_callback(self, packet):
+		payload = bytes(packet[TCP].payload)
+		direction = 'logger' if packet[IP].src in self.logger_ip else 'cloud'
+		if self.traffic_log:
+			self.traffic_log.info('%s:%s -> %s:%s | Payload size: %d | Payload: %s', packet[IP].src, packet[TCP].sport,
+				packet[IP].dst, packet[TCP].dport, len(payload), payload.hex())
+		values = self.decoder.feed(direction, payload)
+		if values:
+			self.data_processor(values)
 
-	def setup_logging(self):
-		logging.basicConfig(filename='full_session_traffic_log.txt', level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+	def start_monitoring(self):
+		log.info('Logger %s; watching traffic to %s', self.logger_ip, self.remote_hostnames)
+		threading.Thread(target=self.update_remote_ips, args=(300,), daemon=True).start()
+		sniff(prn=self.packet_callback, lfilter=self.packet_filter, store=False)

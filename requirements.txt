@@ -1,0 +1,4 @@
+prometheus_client
+dnspython
+# only for --mode sniff
+scapy

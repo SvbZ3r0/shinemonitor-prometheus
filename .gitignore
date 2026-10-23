@@ -9,6 +9,7 @@ __pycache__/
 *.log
 *.out
 *.txt
+!requirements.txt
 *.csv
 
 # Local analysis/capture helpers not included upstream

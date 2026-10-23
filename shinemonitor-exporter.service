@@ -1,0 +1,16 @@
+[Unit]
+Description=ShineMonitor relay and Prometheus exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=gughan
+WorkingDirectory=/home/gughan/shinemonitor
+ExecStart=/usr/bin/python3 shinemonitor_exporter.py --mode relay --listen 0.0.0.0:502 --metrics-port 9127
+# port 502 is below 1024
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
