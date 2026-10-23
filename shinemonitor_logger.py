@@ -65,15 +65,23 @@ class NetworkLogger:
 			log.debug('%s -> %s', self.remote_hostnames, self.remote_ips)
 			time.sleep(update_interval)
 
+	@staticmethod
+	def tcp_payload(packet):
+		"""TCP data only. A bare ACK is padded to the 60-byte Ethernet minimum, and
+		scapy returns those padding bytes as payload; the IP length excludes them."""
+		ip, tcp = packet[IP], packet[TCP]
+		size = ip.len - ip.ihl * 4 - tcp.dataofs * 4
+		return bytes(tcp.payload)[:max(size, 0)]
+
 	def packet_filter(self, packet):
-		if IP in packet and TCP in packet and len(packet[TCP].payload):
+		if IP in packet and TCP in packet and self.tcp_payload(packet):
 			src, dst = packet[IP].src, packet[IP].dst
 			return (src in self.logger_ip and dst in self.remote_ips) or \
 				(src in self.remote_ips and dst in self.logger_ip)
 		return False
 
 	def packet_callback(self, packet):
-		payload = bytes(packet[TCP].payload)
+		payload = self.tcp_payload(packet)
 		direction = 'logger' if packet[IP].src in self.logger_ip else 'cloud'
 		if self.traffic_log:
 			self.traffic_log.info('%s:%s -> %s:%s | Payload size: %d | Payload: %s', packet[IP].src, packet[TCP].sport,

@@ -4,6 +4,10 @@ The logger is pointed at this relay (by DNS or by its own server setting). For e
 connection the relay opens a connection to the real cloud server and copies bytes in
 both directions unchanged, so the ShineMonitor app keeps working. A copy of the traffic
 is decoded on the way through. Decoding errors are logged and never affect forwarding.
+
+With polling off (the default) the two directions are plain byte pipes. With polling
+on, each connection is handled by LoggerLink, which serialises requests to the logger
+and adds read-only requests of its own.
 """
 
 import asyncio
@@ -13,6 +17,7 @@ import time
 from dns import resolver
 
 from parser_utils import StreamDecoder
+from shinemonitor_link import FrameTap, LinkEvents, LoggerLink
 
 log = logging.getLogger('shinemonitor.relay')
 
@@ -48,13 +53,20 @@ class UpstreamResolver:
 
 class Relay:
 	def __init__(self, upstream_host, upstream_port=502, upstream_ip=None,
-			on_values=None, on_connection=None, on_crc_error=None):
+			on_values=None, on_connection=None, on_crc_error=None,
+			poll_interval=0, request_timeout=3.0, link_options=None, events=None, frame_log=None):
 		self.upstream_port = upstream_port
 		self.upstream = None if upstream_ip else UpstreamResolver(upstream_host)
 		self.upstream_ip = upstream_ip
 		self.on_values = on_values or (lambda values: None)
 		self.on_connection = on_connection or (lambda change: None)
 		self.on_crc_error = on_crc_error
+		self.poll_interval = poll_interval
+		self.request_timeout = request_timeout
+		self.link_options = link_options or {}
+		self.events = events or LinkEvents()
+		self.frame_log = frame_log
+		self.server = None
 
 	async def handle(self, logger_reader, logger_writer):
 		peer = logger_writer.get_extra_info('peername')
@@ -67,19 +79,33 @@ class Relay:
 			logger_writer.close()
 			return
 
-		log.info('Relaying %s <-> %s:%s', peer, address, self.upstream_port)
-		decoder = StreamDecoder(on_crc_error=self.on_crc_error)
+		polling = self.poll_interval > 0
+		log.info('Relaying %s <-> %s:%s%s', peer, address, self.upstream_port,
+			' with active polling' if polling else '')
+		connection = self.frame_log.connection_started(peer, f'{address}:{self.upstream_port}', polling) \
+			if self.frame_log else None
 		self.on_connection(+1)
 		try:
-			await asyncio.gather(
-				self.pipe(logger_reader, cloud_writer, decoder, 'logger'),
-				self.pipe(cloud_reader, logger_writer, decoder, 'cloud'),
-			)
+			if polling:
+				await LoggerLink(logger_reader, logger_writer, cloud_reader, cloud_writer,
+					poll_interval=self.poll_interval, request_timeout=self.request_timeout,
+					on_values=self.on_values, events=self.events, frame_log=self.frame_log,
+					connection=connection, **self.link_options).run()
+			else:
+				decoder = StreamDecoder(on_crc_error=self.on_crc_error)
+				await asyncio.gather(
+					self.pipe(logger_reader, cloud_writer, decoder, 'logger',
+						FrameTap('logger', connection, self.frame_log, self.events)),
+					self.pipe(cloud_reader, logger_writer, decoder, 'cloud',
+						FrameTap('cloud', connection, self.frame_log, self.events)),
+				)
 		finally:
 			self.on_connection(-1)
+			if self.frame_log:
+				self.frame_log.connection_ended(connection)
 			log.info('Connection from %s closed', peer)
 
-	async def pipe(self, reader, writer, decoder, direction):
+	async def pipe(self, reader, writer, decoder, direction, tap=None):
 		try:
 			while True:
 				data = await reader.read(65536)
@@ -93,13 +119,22 @@ class Relay:
 						self.on_values(values)
 				except Exception:
 					log.exception('Failed to decode %s data (forwarding continues)', direction)
+				if tap:
+					try:
+						tap.feed(data)
+					except Exception:
+						log.exception('Failed to log %s data (forwarding continues)', direction)
 		except (ConnectionError, asyncio.IncompleteReadError) as e:
 			log.info('%s side closed: %s', direction, e)
 		finally:
 			writer.close()		# closing one side ends the other pipe too
 
-	async def serve(self, host, port):
-		server = await asyncio.start_server(self.handle, host, port)
+	async def start(self, host, port):
+		self.server = await asyncio.start_server(self.handle, host, port)
 		log.info('Relay listening on %s:%s', host, port)
+		return self.server
+
+	async def serve(self, host, port):
+		server = await self.start(host, port)
 		async with server:
 			await server.serve_forever()

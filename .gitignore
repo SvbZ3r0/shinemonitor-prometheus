@@ -16,3 +16,8 @@ __pycache__/
 pcap2csv.py
 shinemonitor_capture.sh
 shinemonitor_parser.py
+
+# Frame log
+*.db
+*.db-wal
+*.db-shm

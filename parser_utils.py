@@ -98,7 +98,8 @@ class EybondStream:
 				break
 			# Lengths below two cannot contain the unit ID and command. Consume
 			# them as malformed frames so one bad prefix does not poison the stream.
-			# This also handles the six-byte all-zero separator seen before replies.
+			# (Six all-zero bytes in old scapy logs were Ethernet padding on bare
+			# ACKs, not stream data; see shinemonitor_logger.py.)
 			frames.append(buffer[:frame_length])
 			buffer = buffer[frame_length:]
 		return frames, buffer
