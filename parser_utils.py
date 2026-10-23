@@ -1,26 +1,11 @@
-"""Decoder for the traffic between a ShineMonitor (Eybond / "LWIP") WiFi logger and the ShineMonitor cloud.
-
-The logger opens a TCP connection to www.shinemonitor.com:502. Over that connection the
-cloud sends requests and the logger answers. Every message is a Modbus-TCP style frame:
-
-	transaction id  2 bytes
-	protocol id     2 bytes
-	length          2 bytes   number of bytes that follow
-	unit id         1 byte    always 0xFF
-	function        1 byte    0x04 = pass-through to the inverter; payload is a Modbus RTU frame
-	                          0x01 / 0x02 = logger-level commands
-	payload         length - 2 bytes
-
-Inverter data is read with RTU "read holding registers" (slave 1, function 3). The cloud
-reads four register blocks; their layout below was worked out from captured traffic of a
-KSY 10 kW three-phase inverter (firmware H910-31100-60).
-"""
+"""Decode the Eybond outer protocol and its enclosed Modbus RTU frames."""
 
 from dataclasses import dataclass
+from enum import IntEnum
 
 
 def crc16_modbus(data):
-	"""Modbus RTU CRC-16 (poly 0xA001, init 0xFFFF). Transmitted low byte first."""
+	"""Return Modbus RTU CRC-16 (poly 0xA001, init 0xFFFF)."""
 	crc = 0xFFFF
 	for byte in data:
 		crc ^= byte
@@ -29,23 +14,204 @@ def crc16_modbus(data):
 	return crc
 
 
+class ProtocolError(ValueError):
+	"""Base class for malformed Eybond or Modbus data."""
+
+
+class CRCMismatch(ProtocolError):
+	"""A Modbus RTU frame has an invalid checksum."""
+
+
+class EybondCommand(IntEnum):
+	"""Known command bytes in the outer Eybond protocol."""
+
+	HEARTBEAT = 0x01
+	LOGGER_PARAMETERS = 0x02
+	INVERTER = 0x04
+
+
+@dataclass(frozen=True)
+class EybondFrame:
+	"""One frame exchanged between the logger and the Eybond cloud.
+
+	Its header resembles Modbus TCP, but ``command`` belongs to Eybond's
+	protocol and ``protocol_id`` is not constrained to zero.
+	"""
+
+	transaction_id: int
+	protocol_id: int
+	unit_id: int
+	command: int
+	payload: bytes = b''
+
+	HEADER_SIZE = 8
+	LENGTH_PREFIX_SIZE = 6
+
+	@property
+	def length(self):
+		return 2 + len(self.payload)  # unit ID + command + payload
+
+	@classmethod
+	def from_bytes(cls, data):
+		if len(data) < cls.HEADER_SIZE:
+			raise ProtocolError('Eybond frame is shorter than its header')
+		length = int.from_bytes(data[4:6], 'big')
+		expected = cls.LENGTH_PREFIX_SIZE + length
+		if length < 2 or len(data) != expected:
+			raise ProtocolError(f'Eybond frame length is {len(data)}, expected {expected}')
+		return cls(
+			int.from_bytes(data[0:2], 'big'),
+			int.from_bytes(data[2:4], 'big'),
+			data[6], data[7], data[8:],
+		)
+
+	def to_bytes(self):
+		return b''.join((
+			self.transaction_id.to_bytes(2, 'big'),
+			self.protocol_id.to_bytes(2, 'big'),
+			self.length.to_bytes(2, 'big'),
+			bytes((self.unit_id, self.command)),
+			self.payload,
+		))
+
+	@classmethod
+	def inverter_request(cls, transaction_id, request, protocol_id=1, unit_id=0xFF):
+		"""Wrap a read-only Modbus request for delivery to the inverter."""
+		if not isinstance(request, ModbusReadRequest):
+			raise TypeError('only ModbusReadRequest can be wrapped for injection')
+		return cls(transaction_id, protocol_id, unit_id, EybondCommand.INVERTER, request.to_bytes())
+
+
+class EybondStream:
+	"""Incrementally split a TCP byte stream into complete Eybond frames."""
+
+	def __init__(self):
+		self.buffer = b''
+
+	@staticmethod
+	def split_bytes(buffer):
+		frames = []
+		while len(buffer) >= EybondFrame.LENGTH_PREFIX_SIZE:
+			length = int.from_bytes(buffer[4:6], 'big')
+			frame_length = EybondFrame.LENGTH_PREFIX_SIZE + length
+			if len(buffer) < frame_length:
+				break
+			# Lengths below two cannot contain the unit ID and command. Consume
+			# them as malformed frames so one bad prefix does not poison the stream.
+			# This also handles the six-byte all-zero separator seen before replies.
+			frames.append(buffer[:frame_length])
+			buffer = buffer[frame_length:]
+		return frames, buffer
+
+	def feed(self, data):
+		raw_frames, self.buffer = self.split_bytes(self.buffer + data)
+		return [EybondFrame.from_bytes(frame) for frame in raw_frames
+			if len(frame) >= EybondFrame.HEADER_SIZE]
+
+
+@dataclass(frozen=True)
+class ModbusReadRequest:
+	"""Standard Modbus RTU function-03 request inside Eybond command 0x04."""
+
+	start_register: int
+	register_count: int
+	slave_address: int = 1
+
+	FUNCTION = 0x03
+
+	def __post_init__(self):
+		if not 0 <= self.start_register <= 0xFFFF:
+			raise ValueError('start_register must be between 0 and 65535')
+		if not 1 <= self.register_count <= 125:
+			raise ValueError('register_count must be between 1 and 125')
+		if not 0 <= self.slave_address <= 0xFF:
+			raise ValueError('slave_address must be between 0 and 255')
+
+	@classmethod
+	def from_bytes(cls, data):
+		if len(data) != 8 or data[1] != cls.FUNCTION:
+			return None
+		if crc16_modbus(data[:6]) != int.from_bytes(data[6:8], 'little'):
+			return None
+		try:
+			return cls(int.from_bytes(data[2:4], 'big'), int.from_bytes(data[4:6], 'big'), data[0])
+		except ValueError:
+			return None
+
+	def to_bytes(self):
+		body = b''.join((
+			bytes((self.slave_address, self.FUNCTION)),
+			self.start_register.to_bytes(2, 'big'),
+			self.register_count.to_bytes(2, 'big'),
+		))
+		return body + crc16_modbus(body).to_bytes(2, 'little')
+
+
+@dataclass(frozen=True)
+class ModbusReadResponse:
+	"""Standard Modbus RTU function-03 response inside Eybond command 0x04."""
+
+	data: bytes
+	slave_address: int = 1
+
+	FUNCTION = 0x03
+
+	@classmethod
+	def from_bytes(cls, frame):
+		if len(frame) < 5 or frame[1] != cls.FUNCTION:
+			return None
+		byte_count = frame[2]
+		if len(frame) != 5 + byte_count:
+			return None
+		if crc16_modbus(frame[:3 + byte_count]) != int.from_bytes(frame[3 + byte_count:], 'little'):
+			raise CRCMismatch('Modbus RTU CRC mismatch')
+		return cls(frame[3:3 + byte_count], frame[0])
+
+	def to_bytes(self):
+		if len(self.data) > 255:
+			raise ValueError('Modbus RTU response data exceeds one-byte length')
+		body = bytes((self.slave_address, self.FUNCTION, len(self.data))) + self.data
+		return body + crc16_modbus(body).to_bytes(2, 'little')
+
+
+@dataclass(frozen=True)
+class ModbusExceptionResponse:
+	"""Standard Modbus RTU exception response, such as function 0x83."""
+
+	request_function: int
+	exception_code: int
+	slave_address: int = 1
+
+	@classmethod
+	def from_bytes(cls, frame):
+		if len(frame) != 5 or not frame[1] & 0x80:
+			return None
+		if crc16_modbus(frame[:3]) != int.from_bytes(frame[3:5], 'little'):
+			raise CRCMismatch('Modbus RTU CRC mismatch')
+		return cls(frame[1] & 0x7F, frame[2], frame[0])
+
+	def to_bytes(self):
+		body = bytes((self.slave_address, self.request_function | 0x80, self.exception_code))
+		return body + crc16_modbus(body).to_bytes(2, 'little')
+
+
 @dataclass(frozen=True)
 class Field:
 	name: str
-	register: int		# offset from the start of the block, in 16-bit registers
+	register: int       # offset from the block start, in 16-bit registers
 	help: str
 	scale: float = 1
-	words: int = 1		# 2 = 32-bit value spread over two registers, high word first
+	words: int = 1      # 2 means a high-word-first 32-bit value
 	signed: bool = False
 
 
 @dataclass(frozen=True)
 class Block:
 	name: str
-	start: int			# first register address the cloud asks for
-	count: int			# number of registers
+	start: int          # first inverter register requested by the cloud
+	count: int          # number of 16-bit registers
 	fields: tuple = ()
-	strings: tuple = ()	# (name, byte offset, byte length) for text fields
+	strings: tuple = () # (name, byte offset, byte length) text fields
 
 
 BLOCKS = {
@@ -90,14 +256,17 @@ BLOCKS = {
 	)),
 }
 
-# Used when a response arrives without its request (e.g. the first frame after a restart).
+# Fallback for captures that contain a reply without its corresponding request.
 BLOCK_BY_BYTE_COUNT = {block.count * 2: block for block in BLOCKS.values()}
-
 STRING_FIELDS = ('firmware', 'model', 'serial', 'logger_id')
 
 
 class ShinemonitorModbusTCPParser:
-	"""Decodes complete frames into metric values. Stateless; see StreamDecoder for TCP streams."""
+	"""Decode Eybond frames and their enclosed Modbus RTU data.
+
+	The historical class name remains as a compatibility API. The protocol
+	boundary is represented by ``EybondFrame`` and the Modbus classes above.
+	"""
 
 	def __init__(self):
 		self.metrics = {'logger_id': 'Logger ID'}
@@ -107,51 +276,46 @@ class ShinemonitorModbusTCPParser:
 
 	@staticmethod
 	def split_frames(buffer):
-		"""Split a byte buffer into complete frames. Returns (frames, leftover bytes)."""
-		frames = []
-		while len(buffer) >= 6:
-			length = int.from_bytes(buffer[4:6], 'big')
-			if len(buffer) < 6 + length:
-				break
-			frames.append(buffer[:6 + length])
-			buffer = buffer[6 + length:]
-		return frames, buffer
+		return EybondStream.split_bytes(buffer)
+
+	@staticmethod
+	def parse_eybond_frame(frame):
+		if len(frame) < EybondFrame.HEADER_SIZE:
+			return None
+		return EybondFrame.from_bytes(frame)
 
 	@staticmethod
 	def parse_frame(frame):
-		"""Split a frame into its header fields. Returns None for frames without a function code."""
-		if len(frame) < 8:
-			return None		# e.g. the 6-byte all-zero frame the logger sends before each reply
+		"""Compatibility dictionary view of an outer Eybond frame."""
+		parsed = ShinemonitorModbusTCPParser.parse_eybond_frame(frame)
+		if not parsed:
+			return None
 		return {
-			'transaction_id': int.from_bytes(frame[0:2], 'big'),
-			'protocol_id': int.from_bytes(frame[2:4], 'big'),
-			'unit_id': frame[6],
-			'function': frame[7],
-			'payload': frame[8:],
+			'transaction_id': parsed.transaction_id,
+			'protocol_id': parsed.protocol_id,
+			'unit_id': parsed.unit_id,
+			'function': parsed.command,
+			'command': parsed.command,
+			'payload': parsed.payload,
 		}
 
 	@staticmethod
 	def parse_read_request(rtu):
-		"""Decode an RTU 'read holding registers' request. Returns (start register, count) or None."""
-		if len(rtu) == 8 and rtu[1] == 0x03 and crc16_modbus(rtu[:6]) == int.from_bytes(rtu[6:8], 'little'):
-			return int.from_bytes(rtu[2:4], 'big'), int.from_bytes(rtu[4:6], 'big')
-		return None
+		request = ModbusReadRequest.from_bytes(rtu)
+		return (request.start_register, request.register_count) if request else None
 
 	@staticmethod
 	def parse_read_response(rtu):
-		"""Decode an RTU 'read holding registers' response. Returns the data bytes, or None if invalid."""
-		if len(rtu) < 5 or rtu[1] != 0x03:
-			return None
-		byte_count = rtu[2]
-		if len(rtu) != 5 + byte_count:
-			return None
-		if crc16_modbus(rtu[:3 + byte_count]) != int.from_bytes(rtu[3 + byte_count:], 'little'):
-			raise ValueError('CRC mismatch')
-		return rtu[3:3 + byte_count]
+		response = ModbusReadResponse.from_bytes(rtu)
+		return response.data if response else None
+
+	@staticmethod
+	def parse_modbus_response(rtu):
+		"""Return a typed read or exception response from an inner RTU frame."""
+		return ModbusReadResponse.from_bytes(rtu) or ModbusExceptionResponse.from_bytes(rtu)
 
 	@staticmethod
 	def decode_block(block, data):
-		"""Turn the data bytes of a register block into {name: value}."""
 		values = {}
 		for field in block.fields:
 			start = field.register * 2
@@ -165,68 +329,68 @@ class ShinemonitorModbusTCPParser:
 		return values
 
 	def decode_response(self, frame, block=None):
-		"""Decode one logger-to-cloud frame. Pass the requested block if known."""
-		info = self.parse_frame(frame)
-		if not info:
+		outer = frame if isinstance(frame, EybondFrame) else self.parse_eybond_frame(frame)
+		if not outer:
 			return {}
-		payload = info['payload']
-		if info['function'] == 0x04:
-			data = self.parse_read_response(payload)
-			if data is None:
+		if outer.command == EybondCommand.INVERTER:
+			response = self.parse_modbus_response(outer.payload)
+			if not isinstance(response, ModbusReadResponse):
 				return {}
-			block = block or BLOCK_BY_BYTE_COUNT.get(len(data))
-			return self.decode_block(block, data) if block and len(data) == block.count * 2 else {}
-		if info['function'] == 0x01:
-			text = payload.decode('ascii', 'replace')
+			block = block or BLOCK_BY_BYTE_COUNT.get(len(response.data))
+			return self.decode_block(block, response.data) if block and len(response.data) == block.count * 2 else {}
+		if outer.command == EybondCommand.HEARTBEAT:
+			text = outer.payload.decode('ascii', 'replace')
 			if len(text) >= 8 and text.isalnum():
 				return {'logger_id': text}
 		return {}
 
 	def interpret_response(self, response_hex):
-		"""Decode a single frame given as hex (kept for the packet-sniffing mode)."""
-		frames, _ = self.split_frames(bytes.fromhex(response_hex))
+		stream = EybondStream()
 		values = {}
-		for frame in frames:
+		for frame in stream.feed(bytes.fromhex(response_hex)):
 			values.update(self.decode_response(frame))
 		return values
 
 
 class StreamDecoder:
-	"""Decodes both directions of one logger<->cloud TCP connection.
+	"""Decode both directions of one logger-to-cloud TCP connection."""
 
-	Requests from the cloud are remembered by transaction id, so each response is decoded
-	using the register block that was actually asked for.
-	"""
-
-	def __init__(self, parser=None, on_crc_error=None):
+	def __init__(self, parser=None, on_crc_error=None, on_modbus_exception=None):
 		self.parser = parser or ShinemonitorModbusTCPParser()
 		self.on_crc_error = on_crc_error or (lambda: None)
-		self.buffers = {'cloud': b'', 'logger': b''}
-		self.pending = {}		# transaction id -> Block
+		self.on_modbus_exception = on_modbus_exception or (lambda response, frame: None)
+		self.streams = {'cloud': EybondStream(), 'logger': EybondStream()}
+		self.pending = {}
+
+	@property
+	def buffers(self):
+		"""Compatibility view of unconsumed bytes in each direction."""
+		return {direction: stream.buffer for direction, stream in self.streams.items()}
 
 	def feed(self, direction, data):
-		"""Feed bytes sent by 'cloud' or 'logger'. Returns {name: value} decoded from complete frames."""
-		frames, self.buffers[direction] = self.parser.split_frames(self.buffers[direction] + data)
+		if direction not in self.streams:
+			raise ValueError("direction must be 'cloud' or 'logger'")
 		values = {}
-		for frame in frames:
-			info = self.parser.parse_frame(frame)
-			if not info:
-				continue
+		for outer in self.streams[direction].feed(data):
 			if direction == 'cloud':
-				if info['function'] == 0x04:
-					request = self.parser.parse_read_request(info['payload'])
-					if request and request[0] in BLOCKS:
-						self.pending[info['transaction_id']] = BLOCKS[request[0]]
-						if len(self.pending) > 64:		# never answered; don't grow forever
+				if outer.command == EybondCommand.INVERTER:
+					request = ModbusReadRequest.from_bytes(outer.payload)
+					if request and request.start_register in BLOCKS:
+						self.pending[outer.transaction_id] = BLOCKS[request.start_register]
+						if len(self.pending) > 64:
 							self.pending.pop(next(iter(self.pending)))
 			else:
-				block = self.pending.pop(info['transaction_id'], None)
+				block = self.pending.pop(outer.transaction_id, None)
 				try:
-					values.update(self.parser.decode_response(frame, block))
-				except ValueError:
+					response = self.parser.parse_modbus_response(outer.payload) \
+						if outer.command == EybondCommand.INVERTER else None
+					if isinstance(response, ModbusExceptionResponse):
+						self.on_modbus_exception(response, outer)
+					else:
+						values.update(self.parser.decode_response(outer, block))
+				except CRCMismatch:
 					self.on_crc_error()
 		return values
 
 
-# Earlier versions of the exporter imported this name.
 DataParser = ShinemonitorModbusTCPParser

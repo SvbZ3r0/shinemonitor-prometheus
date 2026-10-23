@@ -5,6 +5,9 @@ from parser_utils import StreamDecoder, crc16_modbus
 DATA = sys.argv[1]   # directory with modbus_transactions.csv and full_session_traffic_log.txt
 
 def check(name, readings):
+	if not readings:
+		print(f"[{name}] skipped: no decodable readings in input")
+		return
 	energy = [r['energy_total'] for _, r in readings if 'energy_total' in r]
 	power = [r['output_power'] for _, r in readings if 'output_power' in r]
 	print(f"[{name}] readings={len(readings)} energy_total {min(energy)}..{max(energy)} kWh, "
